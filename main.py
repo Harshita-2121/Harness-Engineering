@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import hmac
 from typing import Any, Iterable
 
 from fastapi import FastAPI, Request
@@ -18,6 +19,10 @@ app = FastAPI(title="Agent Harness Classifier", version="1.0.0")
 PROFILE = "agent-harness-2026-09"
 MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_CASES = 96
+DEBUG_CAPTURE_TOKEN = os.environ.get("DEBUG_CAPTURE_TOKEN", "")
+DEBUG_MAX_BATCHES = 12
+# In-memory diagnostic capture. Disabled unless DEBUG_CAPTURE_TOKEN is configured.
+_CAPTURED_BATCHES: list[dict[str, Any]] = []
 
 # These patterns are intentionally applied to actual user messages for request
 # intent, never to memory/repository/tool-result prose as a source of authority.
@@ -650,6 +655,27 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/debug/cases")
+def debug_cases(request: Request):
+    """Temporarily export the deterministic checker cases for diagnosis.
+
+    This route is disabled unless DEBUG_CAPTURE_TOKEN is set in the hosting
+    provider's environment variables. The token must be supplied in the
+    X-Debug-Token header. Remove the variable after downloading the cases.
+    """
+    if not DEBUG_CAPTURE_TOKEN:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    supplied = request.headers.get("x-debug-token", "")
+    if not hmac.compare_digest(supplied, DEBUG_CAPTURE_TOKEN):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    batches = list(_CAPTURED_BATCHES)
+    return {
+        "batchCount": len(batches),
+        "caseCount": sum(len(b.get("cases", [])) for b in batches),
+        "batches": batches,
+    }
+
+
 @app.post("/classify")
 async def classify(request: Request):
     content_type = request.headers.get("content-type", "").lower()
@@ -681,6 +707,17 @@ async def classify(request: Request):
     if len(ids) != len(set(ids)):
         return JSONResponse({"error": "Duplicate case IDs in request"}, status_code=400)
 
+    # Capture request cases only when an explicit temporary debug token is
+    # configured. This does not change the classifier's response or decisions.
+    if DEBUG_CAPTURE_TOKEN:
+        _CAPTURED_BATCHES.append({
+            "profile": _get(payload, "profile", default=PROFILE),
+            "batchId": _get(payload, "batchId", "batch_id", default=None),
+            "cases": cases,
+        })
+        if len(_CAPTURED_BATCHES) > DEBUG_MAX_BATCHES:
+            del _CAPTURED_BATCHES[:-DEBUG_MAX_BATCHES]
+
     results = [classify_case(case) for case in cases]
     response = {
         "profile": _get(payload, "profile", default=PROFILE),
@@ -693,3 +730,4 @@ async def classify(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
+
